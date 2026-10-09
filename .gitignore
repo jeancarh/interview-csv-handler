@@ -1,0 +1,11 @@
+node_modules/
+frontend/dist/
+backend/data/
+backend/web/dist/*
+!backend/web/dist/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+.env
+.DS_Store
+coverage/

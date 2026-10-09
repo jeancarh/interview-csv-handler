@@ -1,0 +1,14 @@
+services:
+  shop:
+    build: .
+    image: interview-csv-handler:local
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    environment:
+      SEED_CSV: /app/testdata/products.csv
+    volumes:
+      - shop-data:/data
+    restart: unless-stopped
+
+volumes:
+  shop-data:

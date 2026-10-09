@@ -1,0 +1,471 @@
+openapi: 3.1.0
+info:
+  title: Shop API
+  version: 1.0.0
+  description: |
+    Product catalog, CSV import and checkout for the e-commerce code challenge.
+
+    Money is always sent as integer cents (`priceCents: 8999` means 89.99) and weight as
+    integer grams, so no floating point is involved anywhere.
+
+    Errors follow RFC 9457 (`application/problem+json`). Validation errors add an `errors`
+    object keyed by field name.
+
+    Test cards for checkout: `4242 4242 4242 4242` is approved, `4000 0000 0000 0002` is declined.
+servers:
+  - url: /
+tags:
+  - name: Products
+  - name: Import
+  - name: Orders
+  - name: Health
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness and database check
+      operationId: health
+      responses:
+        "200":
+          description: Service and database are up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    examples: [ok]
+        "503":
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/products:
+    get:
+      tags: [Products]
+      summary: Search products
+      description: |
+        Full-text search over name, SKU and description with prefix matching
+        (`speak` finds "Bluetooth Speaker"). All filters are optional and combine with AND.
+        Results are ordered by relevance when `q` is given, otherwise by name.
+      operationId: searchProducts
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          example: speaker
+        - name: category
+          in: query
+          schema: { type: string }
+          example: Electronics
+        - name: minPriceCents
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: maxPriceCents
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: inStock
+          in: query
+          description: Only products with stock greater than zero
+          schema: { type: boolean }
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: One page of results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductPage"
+        "400":
+          $ref: "#/components/responses/Problem"
+    post:
+      tags: [Products]
+      summary: Create a product
+      operationId: createProduct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductInput"
+      responses:
+        "201":
+          description: Created
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "409":
+          description: Another active product already uses this SKU
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+
+  /api/v1/products/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Products]
+      summary: Get a product
+      operationId: getProduct
+      responses:
+        "200":
+          description: The product
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "404":
+          $ref: "#/components/responses/Problem"
+    put:
+      tags: [Products]
+      summary: Replace a product
+      description: Full update. Every field is replaced, including stock.
+      operationId: updateProduct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductInput"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "409":
+          $ref: "#/components/responses/Problem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+    delete:
+      tags: [Products]
+      summary: Delete a product
+      description: Soft delete. The product disappears from the catalog but past orders keep their data and the SKU can be reused.
+      operationId: deleteProduct
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/products/import:
+    post:
+      tags: [Import]
+      summary: Import products from a CSV file
+      description: |
+        Expected header (any order, case-insensitive): `name,sku,description,category,price,stock,weight_kg`.
+
+        Rules:
+        - SKU is the key. A known SKU updates the product, a new one creates it.
+        - Stock is only taken from the file when the product is created. Updates never touch stock,
+          so importing again cannot undo purchases.
+        - If a SKU shows up more than once in the file, the last row wins and earlier rows are reported as skipped.
+        - Bad rows are rejected with a reason and the rest of the file still goes in, all in one transaction.
+        - Importing the same file twice reports every row as `unchanged`.
+
+        A broken file (wrong columns, bad quoting) is rejected as a whole with a 400.
+      operationId: importProducts
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Row by row report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportReport"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "413":
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/categories:
+    get:
+      tags: [Products]
+      summary: Categories in use
+      operationId: listCategories
+      responses:
+        "200":
+          description: Distinct categories of active products
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { type: string }
+
+  /api/v1/orders:
+    post:
+      tags: [Orders]
+      summary: Place an order
+      description: |
+        Reserves stock, charges the (fake) card and returns the order.
+
+        Send a unique `Idempotency-Key` per checkout attempt. Repeating the request with the
+        same key and body returns the original order with `200` and `Idempotent-Replayed: true`
+        instead of charging again. Same key with a different body is a `422`.
+
+        A declined card is not an HTTP error: the order is created with status `failed`,
+        the reason is in `failureReason` and the stock is given back.
+      operationId: placeOrder
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 100 }
+          example: 3f0c8a52-6a51-4d0e-9a8e-1f7d2b4c9e10
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrderInput"
+      responses:
+        "201":
+          description: Order created (paid or failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "200":
+          description: Replay of an earlier request with the same key
+          headers:
+            Idempotent-Replayed:
+              schema: { type: string, enum: ["true"] }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "409":
+          description: Not enough stock for one of the items
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+
+  /api/v1/orders/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Orders]
+      summary: Get an order
+      operationId: getOrder
+      responses:
+        "200":
+          description: The order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/Problem"
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+
+  responses:
+    Problem:
+      description: Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationProblem:
+      description: One or more fields are not valid
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: about:blank
+            title: Unprocessable Entity
+            status: 422
+            detail: some fields are not valid
+            errors:
+              name: is required
+
+  schemas:
+    ProductInput:
+      type: object
+      required: [sku, name, category, priceCents, stock]
+      additionalProperties: false
+      properties:
+        sku:
+          type: string
+          maxLength: 64
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+          example: RS-001
+        name:
+          type: string
+          maxLength: 200
+          example: Running Shoes
+        description:
+          type: string
+          maxLength: 2000
+          example: Lightweight running shoes for daily training
+        category:
+          type: string
+          maxLength: 80
+          example: Footwear
+        priceCents:
+          type: integer
+          minimum: 0
+          maximum: 100000000
+          example: 8999
+        stock:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          example: 150
+        weightGrams:
+          type: [integer, "null"]
+          minimum: 0
+          example: 350
+
+    Product:
+      allOf:
+        - $ref: "#/components/schemas/ProductInput"
+        - type: object
+          required: [id, description, weightGrams, createdAt, updatedAt]
+          properties:
+            id: { type: integer }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+
+    ProductPage:
+      type: object
+      required: [items, total, page, pageSize]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Product"
+        total: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+
+    ImportReport:
+      type: object
+      required: [summary, rows]
+      properties:
+        summary:
+          type: object
+          required: [total, created, updated, unchanged, skipped, rejected]
+          properties:
+            total: { type: integer }
+            created: { type: integer }
+            updated: { type: integer }
+            unchanged: { type: integer }
+            skipped: { type: integer }
+            rejected: { type: integer }
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImportRow"
+
+    ImportRow:
+      type: object
+      required: [line, sku, name, status, messages]
+      properties:
+        line:
+          type: integer
+          description: Line number in the file, header is line 1
+        sku: { type: string }
+        name: { type: string }
+        status:
+          type: string
+          enum: [created, updated, unchanged, skipped, rejected]
+        messages:
+          type: array
+          items: { type: string }
+
+    OrderInput:
+      type: object
+      required: [items, cardNumber]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [productId, quantity]
+            properties:
+              productId: { type: integer }
+              quantity: { type: integer, minimum: 1, maximum: 100 }
+        cardNumber:
+          type: string
+          example: "4242 4242 4242 4242"
+
+    Order:
+      type: object
+      required: [id, status, items, totalCents, cardLast4, createdAt]
+      properties:
+        id: { type: integer }
+        status:
+          type: string
+          enum: [pending, paid, failed]
+        items:
+          type: array
+          items:
+            type: object
+            required: [productId, sku, name, unitPriceCents, quantity, subtotalCents]
+            properties:
+              productId: { type: integer }
+              sku: { type: string }
+              name: { type: string }
+              unitPriceCents: { type: integer }
+              quantity: { type: integer }
+              subtotalCents: { type: integer }
+        totalCents: { type: integer }
+        cardLast4: { type: string }
+        failureReason: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        errors:
+          type: object
+          additionalProperties: { type: string }
